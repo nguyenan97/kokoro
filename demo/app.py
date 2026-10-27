@@ -1,4 +1,8 @@
-import spaces
+from pathlib import Path
+from runtime import configure_runtime
+
+configure_runtime()
+
 from kokoro import KModel, KPipeline
 import gradio as gr
 import os
@@ -6,14 +10,23 @@ import random
 import torch
 
 CUDA_AVAILABLE = torch.cuda.is_available()
-models = {gpu: KModel().to('cuda' if gpu else 'cpu').eval() for gpu in [False] + ([True] if CUDA_AVAILABLE else [])}
-pipelines = {lang_code: KPipeline(lang_code=lang_code, model=False) for lang_code in 'ab'}
+REPO_ID = 'hexgrad/Kokoro-82M'
+DATA_DIR = Path(__file__).resolve().parent
+models = {CUDA_AVAILABLE: KModel(repo_id=REPO_ID).to('cuda' if CUDA_AVAILABLE else 'cpu').eval()}
+pipelines = {lang_code: KPipeline(lang_code=lang_code, repo_id=REPO_ID, model=False) for lang_code in 'ab'}
 pipelines['a'].g2p.lexicon.golds['kokoro'] = 'kˈOkəɹO'
 pipelines['b'].g2p.lexicon.golds['kokoro'] = 'kˈQkəɹQ'
 
-@spaces.GPU(duration=30)
+@torch.inference_mode()
 def forward_gpu(ps, ref_s, speed):
     return models[True](ps, ref_s, speed)
+
+
+@torch.inference_mode()
+def forward_cpu(ps, ref_s, speed):
+    if False not in models:
+        models[False] = KModel(repo_id=REPO_ID).eval()
+    return models[False](ps, ref_s, speed)
 
 def generate_first(text, voice='af_heart', speed=1, use_gpu=CUDA_AVAILABLE):
     pipeline = pipelines[voice[0]]
@@ -25,20 +38,20 @@ def generate_first(text, voice='af_heart', speed=1, use_gpu=CUDA_AVAILABLE):
             if use_gpu:
                 audio = forward_gpu(ps, ref_s, speed)
             else:
-                audio = models[False](ps, ref_s, speed)
+                audio = forward_cpu(ps, ref_s, speed)
         except gr.exceptions.Error as e:
             if use_gpu:
                 gr.Warning(str(e))
                 gr.Info('Retrying with CPU. To avoid this error, change Hardware to CPU.')
-                audio = models[False](ps, ref_s, speed)
+                audio = forward_cpu(ps, ref_s, speed)
             else:
                 raise gr.Error(e)
-        return (24000, audio.numpy()), ps
+        return (24000, audio.mul(32767).clamp(-32768, 32767).to(torch.int16).numpy()), ps
     return None, ''
 
 # Arena API
 def predict(text, voice='af_heart', speed=1):
-    return generate_first(text, voice, speed, use_gpu=False)[0]
+    return generate_first(text, voice, speed, use_gpu=CUDA_AVAILABLE)[0]
 
 def tokenize_first(text, voice='af_heart'):
     pipeline = pipelines[voice[0]]
@@ -50,38 +63,34 @@ def generate_all(text, voice='af_heart', speed=1, use_gpu=CUDA_AVAILABLE):
     pipeline = pipelines[voice[0]]
     pack = pipeline.load_voice(voice)
     use_gpu = use_gpu and CUDA_AVAILABLE
-    first = True
     for _, ps, _ in pipeline(text, voice, speed):
         ref_s = pack[len(ps)-1]
         try:
             if use_gpu:
                 audio = forward_gpu(ps, ref_s, speed)
             else:
-                audio = models[False](ps, ref_s, speed)
+                audio = forward_cpu(ps, ref_s, speed)
         except gr.exceptions.Error as e:
             if use_gpu:
                 gr.Warning(str(e))
                 gr.Info('Switching to CPU')
-                audio = models[False](ps, ref_s, speed)
+                audio = forward_cpu(ps, ref_s, speed)
             else:
                 raise gr.Error(e)
-        yield 24000, audio.numpy()
-        if first:
-            first = False
-            yield 24000, torch.zeros(1).numpy()
+        yield 24000, audio.mul(32767).clamp(-32768, 32767).to(torch.int16).numpy()
 
-with open('en.txt', 'r') as r:
+with (DATA_DIR / 'en.txt').open(encoding='utf-8') as r:
     random_quotes = [line.strip() for line in r]
 
 def get_random_quote():
     return random.choice(random_quotes)
 
 def get_gatsby():
-    with open('gatsby5k.md', 'r') as r:
+    with (DATA_DIR / 'gatsby5k.md').open(encoding='utf-8') as r:
         return r.read().strip()
 
 def get_frankenstein():
-    with open('frankenstein5k.md', 'r') as r:
+    with (DATA_DIR / 'frankenstein5k.md').open(encoding='utf-8') as r:
         return r.read().strip()
 
 CHOICES = {
@@ -114,8 +123,7 @@ CHOICES = {
 '🇬🇧 🚹 Lewis': 'bm_lewis',
 '🇬🇧 🚹 Daniel': 'bm_daniel',
 }
-for v in CHOICES.values():
-    pipelines[v[0]].load_voice(v)
+pipelines['a'].load_voice('af_heart')
 
 TOKEN_NOTE = '''
 💡 Customize pronunciation with Markdown link syntax and /slashes/ like `[Kokoro](/kˈOkəɹO/)`
@@ -136,7 +144,7 @@ with gr.Blocks() as generate_tab:
         gr.Markdown(TOKEN_NOTE)
         predict_btn = gr.Button('Predict', variant='secondary', visible=False)
 
-STREAM_NOTE = ['⚠️ There is an unknown Gradio bug that might yield no audio the first time you click `Stream`.']
+STREAM_NOTE = ['Streams every text chunk. Use Stop to cancel generation.']
 STREAM_NOTE = '\n\n'.join(STREAM_NOTE)
 
 with gr.Blocks() as stream_tab:
@@ -146,7 +154,6 @@ with gr.Blocks() as stream_tab:
         stop_btn = gr.Button('Stop', variant='stop')
     with gr.Accordion('Note', open=True):
         gr.Markdown(STREAM_NOTE)
-        gr.DuplicateButton()
 
 API_OPEN = True
 with gr.Blocks() as app:
@@ -156,10 +163,10 @@ with gr.Blocks() as app:
             with gr.Row():
                 voice = gr.Dropdown(list(CHOICES.items()), value='af_heart', label='Voice', info='Quality and availability vary by language')
                 use_gpu = gr.Dropdown(
-                    [('ZeroGPU 🚀', True), ('CPU 🐌', False)],
+                    [('NVIDIA CUDA', True), ('CPU', False)],
                     value=CUDA_AVAILABLE,
                     label='Hardware',
-                    info='GPU is usually faster, but has a usage quota',
+                    info=torch.cuda.get_device_name(0) if CUDA_AVAILABLE else 'CUDA unavailable',
                     interactive=CUDA_AVAILABLE
                 )
             speed = gr.Slider(minimum=0.5, maximum=2, value=1, step=0.1, label='Speed')
@@ -172,11 +179,19 @@ with gr.Blocks() as app:
     random_btn.click(fn=get_random_quote, inputs=[], outputs=[text])
     gatsby_btn.click(fn=get_gatsby, inputs=[], outputs=[text])
     frankenstein_btn.click(fn=get_frankenstein, inputs=[], outputs=[text])
-    generate_btn.click(fn=generate_first, inputs=[text, voice, speed, use_gpu], outputs=[out_audio, out_ps])
+    generate_btn.click(fn=generate_first, inputs=[text, voice, speed, use_gpu], outputs=[out_audio, out_ps], concurrency_id='tts', concurrency_limit=1)
     tokenize_btn.click(fn=tokenize_first, inputs=[text, voice], outputs=[out_ps])
-    stream_event = stream_btn.click(fn=generate_all, inputs=[text, voice, speed, use_gpu], outputs=[out_stream])
+    stream_event = stream_btn.click(fn=generate_all, inputs=[text, voice, speed, use_gpu], outputs=[out_stream], concurrency_id='tts', concurrency_limit=1)
     stop_btn.click(fn=None, cancels=stream_event)
-    predict_btn.click(fn=predict, inputs=[text, voice, speed], outputs=[out_audio])
+    predict_btn.click(fn=predict, inputs=[text, voice, speed], outputs=[out_audio], concurrency_id='tts', concurrency_limit=1)
 
 if __name__ == '__main__':
-    app.queue(api_open=API_OPEN).launch(server_name="0.0.0.0", server_port=40001, show_api=API_OPEN)
+    if CUDA_AVAILABLE:
+        forward_gpu('həlˈO wˈɜɹld', pipelines['a'].load_voice('af_heart')[11], 1)
+        print(f'CUDA ready: {torch.cuda.get_device_name(0)}; threads={torch.get_num_threads()}', flush=True)
+    app.queue(api_open=API_OPEN, max_size=16).launch(
+        server_name=os.getenv('KOKORO_HOST', '127.0.0.1'),
+        server_port=int(os.getenv('KOKORO_PORT', '7860')),
+        show_api=API_OPEN,
+        inbrowser=os.getenv('KOKORO_OPEN_BROWSER', '0') == '1',
+    )

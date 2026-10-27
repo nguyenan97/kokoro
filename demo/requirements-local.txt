@@ -1,0 +1,8 @@
+# Install CUDA PyTorch separately; see README-local.md.
+-e .
+torch==2.8.0
+transformers==4.57.6
+gradio==5.49.1
+espeakng-loader==0.2.4
+soundfile
+pip
